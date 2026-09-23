@@ -1,0 +1,518 @@
+/**
+ * 面板拖动 / 缩放 / 自适应弹出方向的 DOM 级自检（可交互性回归）。
+ * 运行：node test/panel.mjs
+ *
+ * 用最小 React 外壳渲染 lib/client.js 的 TideCard，直接派发 pointer 事件并观察
+ * 样式与 localStorage，覆盖：默认自适应 → 拖动 → 缩放 → 夹紧 → 复位 → 弹出方向翻转。
+ */
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+
+// ── 最小宿主环境 ────────────────────────────────────────────────────────
+const storage = new Map()
+global.localStorage = {
+  getItem: k => (storage.has(k) ? storage.get(k) : null),
+  setItem: (k, v) => storage.set(k, String(v)),
+  removeItem: k => storage.delete(k),
+}
+// 面板位置由 measure() 里的 requestAnimationFrame 计算，测试内同步执行即可。
+global.requestAnimationFrame = fn => { fn(); return 0 }
+global.cancelAnimationFrame = () => {}
+global.ResizeObserver = class { observe() {} disconnect() {} }
+global.MutationObserver = class { observe() {} disconnect() {} }
+// 组件里的秒级倒计时会 setInterval；测试不需要真实计时，否则进程无法退出。
+const timers = new Set()
+global.setInterval = fn => { const id = { fn }; timers.add(id); return id }
+global.clearInterval = id => timers.delete(id)
+
+const listeners = new Map()
+global.window = {
+  innerWidth: 1200,
+  innerHeight: 800,
+  addEventListener: (t, fn) => listeners.set(t, fn),
+  removeEventListener: t => listeners.delete(t),
+}
+
+// 输入框卡片：徽章与面板都以它为锚（rect 可控，用于验证弹出方向）。
+// 卡片靠左，徽章才能正常贴在卡片右侧（否则徽章会被移到卡片上方，纵向两侧都缺空间）。
+const composer = { rect: { left: 200, top: 500, right: 400, bottom: 600, width: 200, height: 100 } }
+function setComposerTop(top) {
+  composer.rect = { left: 200, top, right: 400, bottom: top + 100, width: 200, height: 100 }
+}
+
+/** tw-root 容器：client.js 用它的 offsetWidth/offsetHeight 做徽章尺寸测量。
+ *  矩形按「徽章实际样式坐标」动态计算，否则面板定位会读到错误的徽章位置。 */
+function makeChipElement() {
+  const rect = { left: 0, top: 0, right: 180, bottom: 24, width: 180, height: 24 }
+  return {
+    name: 'tw-root',
+    offsetWidth: 180,
+    offsetHeight: 24,
+    classList: { add() {}, remove() {} },
+    contains: () => true,
+    getBoundingClientRect: () => ({ ...rect }),
+    /** 由测试在每次渲染后调用：把样式里的 right/bottom 换算成视口矩形。 */
+    syncFromStyle(style) {
+      if (style === undefined || style === null) return
+      const right = Number(style.right)
+      const bottom = Number(style.bottom)
+      if (!Number.isFinite(right) || !Number.isFinite(bottom)) return
+      rect.right = window.innerWidth - right
+      rect.left = rect.right - 180
+      rect.bottom = window.innerHeight - bottom
+      rect.top = rect.bottom - 24
+    },
+  }
+}
+
+/** 假面板元素：client.js 只用到 classList / getBoundingClientRect。 */
+function makePanelElement() {
+  return {
+    name: 'panel',
+    offsetWidth: 320,
+    offsetHeight: 430,
+    classList: { add() {}, remove() {} },
+    contains: () => true,
+    getBoundingClientRect: () => ({ left: 8, top: 200, right: 328, bottom: 630, width: 320, height: 430 }),
+  }
+}
+
+let captured = null
+global.document = {
+  querySelector: selector => (selector === '[data-composer-card]' ? { getBoundingClientRect: () => composer.rect } : null),
+  createElement: () => ({ setAttribute() {}, style: {}, textContent: '' }),
+  head: { appendChild() {} },
+  addEventListener() {},
+  removeEventListener() {},
+  body: {},
+}
+window.__ModuleLoader__ = { load: m => { captured = m } }
+
+// ── 最小 React 外壳（每次 mount 重置 hook 状态）─────────────────────────
+const state = { hooks: [], cursor: 0, dirty: false, renderedBefore: false, tree: null, pending: [], component: null, props: null }
+
+const react = {
+  useState(init) {
+    const i = state.cursor++
+    if (state.hooks.length <= i) state.hooks[i] = { value: typeof init === 'function' ? init() : init }
+    const hook = state.hooks[i]
+    return [hook.value, next => {
+      const value = typeof next === 'function' ? next(hook.value) : next
+      if (Object.is(value, hook.value)) return
+      hook.value = value
+      schedule()
+    }]
+  },
+  useEffect(fn, deps) {
+    const i = state.cursor++
+    const prev = state.hooks[i]
+    // 依赖数组按浅比较判断是否重跑（与 React 行为一致）：无数组=每次；空数组=仅首次。
+    let changed
+    if (prev === undefined || deps === undefined) changed = true
+    else if (!Array.isArray(prev.deps) || prev.deps.length !== deps.length) changed = true
+    else changed = deps.some((d, k) => !Object.is(d, prev.deps[k]))
+    if (prev === undefined) state.hooks[i] = { deps, cleanup: undefined }
+    else state.hooks[i].deps = deps
+    if (!changed) return
+    const hook = state.hooks[i]
+    state.pending.push(() => {
+      if (typeof hook.cleanup === 'function') hook.cleanup()
+      hook.cleanup = fn()
+    })
+  },
+  useRef(init) {
+    const i = state.cursor++
+    if (state.hooks.length <= i) state.hooks[i] = { current: init }
+    return state.hooks[i]
+  },
+  createElement: (type, props, ...children) => {
+    const node = { type, props: { ...(props ?? {}), children: children.length > 1 ? children : children[0] } }
+    // 模拟 React 挂载 ref：按 className 区分 tw-root（徽章容器）与面板。
+    const ref = props?.ref
+    if (ref !== null && typeof ref === 'object') {
+      const isRoot = typeof props?.className === 'string' && props.className.includes('tw-root')
+      ref.current = isRoot ? makeChipElement() : makePanelElement()
+    }
+    return node
+  },
+}
+
+function render() {
+  state.cursor = 0
+  state.tree = state.component(state.props)
+  // 把徽章实际坐标同步给假元素，后续测量（面板定位）才拿到正确矩形。
+  const chipEl = state.tree?.props?.ref?.current
+  if (chipEl !== null && chipEl !== undefined && typeof chipEl.syncFromStyle === 'function') {
+    chipEl.syncFromStyle(state.tree.props?.style)
+  }
+}
+function flush() {
+  state.dirty = false
+  const hadEffects = state.pending.length > 0
+  const fns = state.pending.splice(0, state.pending.length)
+  for (const fn of fns) fn()
+  if (hadEffects || !state.renderedBefore || state.dirty) render()
+  state.renderedBefore = true
+}
+function schedule() {
+  state.dirty = true
+  queueMicrotask(flush)
+}
+/** 渲染 + 结算，直到状态收敛（面板定位依赖「徽章矩形」而徽章矩形又由渲染决定，
+ *  所以需要迭代几轮；最多 8 轮，避免意外死循环）。 */
+function renderAndSettle() {
+  for (let i = 0; i < 8; i += 1) {
+    const before = JSON.stringify(state.tree?.props?.style ?? null) + state.hooks.map(h => JSON.stringify(h?.value ?? null)).join('|')
+    render()
+    flush()
+    const after = JSON.stringify(state.tree?.props?.style ?? null) + state.hooks.map(h => JSON.stringify(h?.value ?? null)).join('|')
+    if (before === after) return
+  }
+}
+/** 挂载（重置全部 hook 状态，模拟全新组件实例）。 */
+function mount(component, props) {
+  state.hooks = []
+  state.cursor = 0
+  state.dirty = false
+  state.renderedBefore = false
+  state.tree = null
+  state.pending = []
+  state.component = component
+  state.props = props
+  renderAndSettle()
+}
+const settle = async () => {
+  await Promise.resolve(); flush()
+  await Promise.resolve(); renderAndSettle()
+}
+
+new Function('window', 'document', readFileSync('lib/client.js', 'utf8'))(globalThis.window, globalThis.document)
+const client = captured.factory(name => (name === 'react' ? react : (() => { throw new Error('unexpected require: ' + name) })()))
+const TideCard = client.__test__?.TideCard
+assert.ok(TideCard !== undefined, 'lib/client.js 未导出 __test__.TideCard')
+
+const usageProjection = {
+  model: 'deepseek-flash',
+  input: 1000,
+  output: 500,
+  cacheRead: 0,
+  cacheWrite: 0,
+  reasoning: 0,
+  cost: 0.001,
+  byModel: { 'deepseek-flash': { input: 1000, output: 500, cacheRead: 0, cacheWrite: 0, reasoning: 0, cost: 0.001 } },
+}
+const baseProps = {
+  useSessions: selector => selector({ current: 'session-1' }),
+  useProjection: () => usageProjection,
+}
+storage.set('dsh-tidewatch:expanded', '1')
+
+// ── 查询工具 ────────────────────────────────────────────────────────────
+const tree = () => state.tree
+function find(node, predicate) {
+  if (node === null || node === undefined || typeof node !== 'object') return null
+  if (predicate(node)) return node
+  const kids = node.props?.children
+  const list = Array.isArray(kids) ? kids.flat(Infinity) : [kids]
+  for (const kid of list) {
+    const hit = find(kid, predicate)
+    if (hit !== null) return hit
+  }
+  return null
+}
+const byClass = name => node => typeof node.props?.className === 'string' && node.props.className.split(' ').includes(name)
+const classOf = node => (typeof node.props?.className === 'string' ? node.props.className : '')
+const styleOf = node => node?.props?.style ?? {}
+const panelEl = () => find(tree(), byClass('tw-panel'))
+const headEl = () => find(tree(), byClass('tw-panel-head'))
+const gripEl = () => find(tree(), byClass('tw-grip'))
+const resetBtn = () => find(tree(), node => node.type === 'button' && node.props?.className === 'tw-panel-reset')
+const storedGeom = () => {
+  const raw = storage.get('dsh-tidewatch-panel-v1')
+  return raw === undefined ? null : JSON.parse(raw)
+}
+
+const GEOM_KEY = 'dsh-tidewatch-panel-v1'
+const POS_KEY = 'dsh-tidewatch-position-v1'
+const CUSTOM = { width: 340, height: 430, offsetX: 0, offsetY: 0 }
+const mountDefault = () => { storage.delete(GEOM_KEY); storage.delete(POS_KEY); mount(TideCard, { ...baseProps }) }
+const mountCustom = (geom = { ...CUSTOM }) => {
+  storage.set(GEOM_KEY, JSON.stringify(geom))
+  storage.delete(POS_KEY)
+  mount(TideCard, { ...baseProps })
+}
+
+/** 完整拖拽：pointerdown → pointermove → pointerup，并结算渲染。 */
+async function drag(el, fromX, fromY, toX, toY) {
+  assert.ok(el !== null && el !== undefined, '拖拽目标不存在')
+  const down = el.props.onPointerDown
+  assert.equal(typeof down, 'function', '拖拽目标未绑定 onPointerDown')
+  down({ button: 0, clientX: fromX, clientY: fromY, preventDefault() {}, stopPropagation() {}, target: { closest: () => null } })
+  const move = listeners.get('pointermove')
+  assert.equal(typeof move, 'function', '未注册 pointermove 监听')
+  move({ clientX: toX, clientY: toY })
+  listeners.get('pointerup')({})
+  await settle()
+}
+
+let passed = 0
+async function check(name, fn) {
+  await fn()
+  passed += 1
+  console.log('  ok', name)
+}
+
+console.log('展开面板的可拖动 / 可缩放 / 自适应方向')
+
+// ── 场景 1：默认自适应 ──────────────────────────────────────────────────
+await check('默认态：自适应布局，抓手常驻可见、复位按钮不显示、头部不可拖动', () => {
+  mountDefault()
+  const panel = panelEl()
+  assert.ok(panel !== null, '未渲染面板')
+  assert.ok(classOf(panel).includes('tw-panel-fit'), `实际 className=${classOf(panel)}`)
+  assert.equal(classOf(panel).includes('tw-panel-custom'), false)
+  assert.equal(styleOf(panel).width, 320, '默认宽度 320')
+  assert.equal(styleOf(panel).height, undefined, '默认高度自适应（不固定 height）')
+  assert.ok(styleOf(panel).maxHeight > 0, '应给出 maxHeight 上限')
+  assert.ok(styleOf(panel).left >= 0 && styleOf(panel).top >= 0, '面板应已按视口定位')
+  assert.equal(styleOf(panel).visibility, undefined, '已测量，不应再隐藏')
+  // 抓手常驻可见（否则用户不知道面板能缩放），未自定义时不显示「复位面板」
+  assert.ok(gripEl() !== null, '默认态也应显示抓手')
+  assert.equal(typeof gripEl().props.onPointerDown, 'function', '抓手应可直接拖动')
+  assert.equal(resetBtn(), null, '默认态不应显示复位按钮')
+  assert.equal(headEl().props.onPointerDown, undefined, '默认态头部不应可拖动')
+})
+
+// 抓手贴在「面板靠徽章的那条竖边」：面板开向哪边，就朝哪边拖会变宽。
+const opensLeft = () => classOf(panelEl()).includes('tw-panel-left')
+/** 抓手所在的竖边坐标（右开 = 右缘，左开 = 左缘）。 */
+const gripEdgeX = style => (opensLeft() ? style.left : style.left + style.width)
+
+await check('默认态直接拖抓手即可缩放（无需先做别的操作）', async () => {
+  mountDefault()
+  assert.equal(storedGeom(), null, '前置条件：尚无自定义几何')
+  const before = styleOf(panelEl())
+  const grip = gripEl()
+  // 朝面板开向拖 = 变宽（抓手跟着指针往外走）
+  const toX = opensLeft() ? 250 : 350
+  await drag(grip, 300, 700, toX, 700)
+  const geom = storedGeom()
+  assert.ok(geom !== null, '拖动后应持久化几何')
+  assert.equal(geom.width, 370, `向外拖 50 → 宽应 320+50，实际 ${geom.width}`)
+  assert.ok(classOf(panelEl()).includes('tw-panel-custom'), '拖动后进入自定义态')
+  assert.ok(styleOf(panelEl()).width > before.width, '样式宽度应变大')
+})
+
+await check('抓手紧跟指针（右开面板）：向右拖 50 → 右缘右移 50，左缘不动', async () => {
+  mountCustom()
+  assert.equal(opensLeft(), false, '前置条件：本 mock 下应右开')
+  const before = styleOf(panelEl())
+  await drag(gripEl(), 300, 700, 350, 700)
+  const after = styleOf(panelEl())
+  assert.equal(after.left, before.left, '左缘应保持不动')
+  assert.equal(after.width, before.width + 50, `宽度应 +50，实际 ${after.width}`)
+  assert.equal(after.left + after.width, before.left + before.width + 50, '右缘应右移 50（= 指针位移）')
+})
+
+await check('抓手紧跟指针（右开面板）：向左拖 50 → 右缘左移 50（变窄）', async () => {
+  mountCustom()
+  const before = styleOf(panelEl())
+  await drag(gripEl(), 300, 700, 250, 700)
+  const after = styleOf(panelEl())
+  assert.equal(after.left, before.left, '左缘应保持不动')
+  assert.equal(after.width, before.width - 50, `宽度应 -50，实际 ${after.width}`)
+  assert.equal(after.left + after.width, before.left + before.width - 50, '右缘应左移 50（= 指针位移）')
+})
+
+await check('抓手紧跟指针（左开面板）：向左拖 → 变宽且右缘（贴徽章那侧）不动', async () => {
+  const saveRect = composer.rect
+  // 徽章贴视口右缘 → 面板改为向左开
+  composer.rect = { left: 1100, top: 500, right: 1190, bottom: 600, width: 90, height: 100 }
+  try {
+    mountCustom()
+    assert.equal(opensLeft(), true, '前置条件：应左开')
+    const before = styleOf(panelEl())
+    const beforeRight = before.left + before.width
+    assert.equal(gripEdgeX(before), before.left, '抓手应在左缘')
+    await drag(gripEl(), 300, 700, 250, 700) // 向左拖 50
+    const after = styleOf(panelEl())
+    assert.equal(after.right === undefined ? after.left + after.width : after.right, beforeRight, '右缘应保持不动（贴徽章那侧）')
+    assert.equal(after.width, before.width + 50, `宽度应 +50，实际 ${after.width}`)
+    assert.ok(after.left <= before.left, `左缘应向左（或贴边），实际 ${after.left}`)
+  } finally {
+    composer.rect = saveRect
+  }
+})
+
+await check('抓手紧跟指针（左开面板）：向右拖 → 变窄且右缘不动', async () => {
+  const saveRect = composer.rect
+  composer.rect = { left: 1100, top: 500, right: 1190, bottom: 600, width: 90, height: 100 }
+  try {
+    mountCustom()
+    const before = styleOf(panelEl())
+    const beforeRight = before.left + before.width
+    await drag(gripEl(), 300, 700, 350, 700) // 向右拖 50
+    const after = styleOf(panelEl())
+    assert.equal(after.left + after.width, beforeRight, '右缘应保持不动')
+    assert.equal(after.width, before.width - 50, `宽度应 -50，实际 ${after.width}`)
+  } finally {
+    composer.rect = saveRect
+  }
+})
+
+await check('抓手紧跟指针：向下拖 50 → 变高 50（顶边不动，或已贴底则底边不动）', async () => {
+  mountCustom({ width: 340, height: 300, offsetX: 0, offsetY: 0 })
+  const before = styleOf(panelEl())
+  await drag(gripEl(), 300, 700, 300, 750)
+  const after = styleOf(panelEl())
+  assert.equal(after.height, before.height + 50, `高度应 +50，实际 ${after.height}`)
+  if (after.top === before.top) {
+    assert.equal(after.top + after.height, before.top + before.height + 50, '顶边不动时底边应下移 50')
+  } else {
+    assert.equal(after.top + after.height, before.top + before.height, '已贴视口底时底边不动、顶边上移')
+  }
+})
+
+// ── 场景 2：自定义几何下的拖动 / 缩放 / 复位 ────────────────────────────
+await check('自定义态：套 tw-panel-custom、渲染抓手与复位按钮', () => {
+  mountCustom()
+  assert.ok(classOf(panelEl()).includes('tw-panel-custom'))
+  assert.equal(styleOf(panelEl()).width, 340, '自定义宽度应生效')
+  assert.equal(styleOf(panelEl()).height, 430)
+  assert.ok(gripEl() !== null, '应渲染抓手')
+  assert.ok(resetBtn() !== null, '应显示复位按钮')
+  assert.equal(typeof headEl().props.onPointerDown, 'function', '自定义态头部可拖动')
+})
+
+await check('头部拖动：位移写入 localStorage，面板按基准 + 位移定位', async () => {
+  mountCustom()
+  const base = styleOf(panelEl())
+  await drag(headEl(), 500, 500, 530, 470) // 指针向右 30、向上 30
+  const geom = storedGeom()
+  assert.ok(geom !== null, '几何应被持久化')
+  assert.equal(geom.offsetX, 30, `右拖 30 → offsetX 30，实际 ${geom.offsetX}`)
+  assert.equal(geom.offsetY, -30, `上拖 30 → offsetY -30，实际 ${geom.offsetY}`)
+  assert.equal(geom.width, 340, '仅拖动不改宽度')
+  assert.equal(geom.height, 430, '仅拖动不改高度')
+  const style = styleOf(panelEl())
+  assert.equal(style.left, base.left + 30, `left 应为基准+30，实际 ${style.left}`)
+  assert.equal(style.top, base.top - 30, `top 应为基准-30，实际 ${style.top}`)
+})
+
+await check('头部拖动越界：位移被夹紧在可视区内', async () => {
+  mountCustom()
+  await drag(headEl(), 500, 500, 5000, 5000) // 右下拖到底
+  let style = styleOf(panelEl())
+  assert.ok(style.left >= 8 && style.left + style.width <= 1200 - 8, `面板水平越界：left=${style.left}`)
+  assert.ok(style.top >= 8 && style.top + style.height <= 800 - 8, `面板垂直越界：top=${style.top}`)
+  assert.equal(style.left, 1200 - 8 - style.width, '右拖到底应贴右边距')
+  await drag(headEl(), 500, 500, -5000, -5000) // 左上拖到底
+  style = styleOf(panelEl())
+  assert.equal(style.left, 8, `左拖到底应贴左边距，实际 ${style.left}`)
+})
+
+await check('抓手缩放：右缘 / 底边跟随指针（向右下拖 → 宽高各 +60）', async () => {
+  mountCustom()
+  await drag(gripEl(), 300, 700, 360, 760)
+  const geom = storedGeom()
+  assert.equal(geom.width, 400, `宽应 340+60，实际 ${geom.width}`)
+  assert.equal(geom.height, 490, `高应 430+60，实际 ${geom.height}`)
+  assert.equal(styleOf(panelEl()).width, 400, '样式宽度应与记录一致')
+  assert.equal(styleOf(panelEl()).height, 490, '样式高度应与记录一致')
+})
+
+await check('抓手缩放：越界拖拽被夹在上下限与视口之间', async () => {
+  mountCustom()
+  await drag(gripEl(), 300, 700, -5000, -5000)
+  let geom = storedGeom()
+  assert.ok(geom.width >= 240, `宽应 ≥240，实际 ${geom.width}`)
+  assert.ok(geom.height >= 180, `高应 ≥180，实际 ${geom.height}`)
+  await drag(gripEl(), 300, 700, 5000, 5000)
+  geom = storedGeom()
+  assert.ok(geom.width <= 1200 - 16, `宽应 ≤视口，实际 ${geom.width}`)
+  assert.ok(geom.height <= 800 - 16, `高应 ≤视口，实际 ${geom.height}`)
+  const style = styleOf(panelEl())
+  assert.ok(style.left >= 8 && style.left + style.width <= 1200 - 8, '缩放后仍应留在视口内')
+})
+
+await check('头部按下按钮区域时不触发拖动（避免与点击冲突）', () => {
+  mountCustom()
+  listeners.delete('pointermove')
+  headEl().props.onPointerDown({
+    button: 0, clientX: 500, clientY: 500, preventDefault() {}, stopPropagation() {},
+    target: { closest: () => ({}) }, // 命中 button / .tw-grip
+  })
+  assert.equal(listeners.get('pointermove'), undefined, '从按钮上按下不应注册拖动监听')
+  assert.equal(storedGeom().offsetX, 0, '位移不应变化')
+})
+
+await check('复位面板：清空 localStorage 并回到自适应布局', async () => {
+  mountCustom({ width: 500, height: 600, offsetX: 20, offsetY: -10 })
+  assert.ok(storedGeom() !== null)
+  resetBtn().props.onClick({ stopPropagation() {} })
+  await settle()
+  assert.equal(storage.has(GEOM_KEY), false, 'localStorage 应已清空')
+  assert.ok(classOf(panelEl()).includes('tw-panel-fit'), '应回到 tw-panel-fit')
+  assert.ok(gripEl() !== null, '复位后抓手仍常驻可见')
+  assert.equal(resetBtn(), null, '复位后隐藏复位按钮')
+  assert.equal(styleOf(panelEl()).width, 320, '复位后回到默认宽度 320')
+  assert.equal(styleOf(panelEl()).height, undefined, '复位后高度恢复自适应')
+})
+
+// ── 场景 3：自适应弹出方向（「跑到可视范围外」的根因回归）───────────────
+await check('输入框在视口顶部（长会话向下滚后）：面板自动翻到徽章下方，不顶出屏幕', () => {
+  setComposerTop(16)
+  mountDefault()
+  const style = styleOf(panelEl())
+  assert.ok(classOf(panelEl()).includes('tw-panel-below'), `应带 tw-panel-below，实际 ${classOf(panelEl())}`)
+  assert.ok(style.top >= 8, `面板顶边越界：top=${style.top}`)
+  assert.ok(style.top + style.maxHeight <= 800 - 8, `面板底边越界：${style.top + style.maxHeight}`)
+  setComposerTop(500)
+})
+
+await check('输入框在中下部：面板仍向上弹出（默认行为不变）', () => {
+  setComposerTop(500)
+  mountDefault()
+  const style = styleOf(panelEl())
+  assert.equal(classOf(panelEl()).includes('tw-panel-below'), false, '不应翻到下方')
+  assert.ok(style.top >= 8, `面板顶边越界：top=${style.top}`)
+  assert.ok(style.top + style.maxHeight <= 800 - 8, `面板底边越界：${style.top + style.maxHeight}`)
+})
+
+await check('视口变矮时面板高度被压缩，不会顶出屏幕', () => {
+  const originalH = global.window.innerHeight
+  global.window.innerHeight = 320
+  try {
+    setComposerTop(240)
+    mountDefault()
+    const style = styleOf(panelEl())
+    assert.ok(style.maxHeight <= 320 - 16, `maxHeight 应被压缩，实际 ${style.maxHeight}`)
+    assert.ok(style.top >= 8 && style.top + style.maxHeight <= 320 - 8, `越界：top=${style.top} maxH=${style.maxHeight}`)
+  } finally {
+    global.window.innerHeight = originalH
+    setComposerTop(500)
+  }
+})
+
+await check('面板翻到下方时抓手图标翻转（拖动方向与成长方向一致）', () => {
+  setComposerTop(16)
+  mountCustom()
+  const grip = gripEl()
+  assert.ok(grip !== null, '应渲染抓手')
+  assert.ok(classOf(grip).includes('tw-grip-up'), `下方弹出时抓手应为 tw-grip-up，实际 ${classOf(grip)}`)
+  assert.ok(classOf(panelEl()).includes('tw-panel-below'), '面板应翻到下方')
+  setComposerTop(500)
+})
+
+await check('面板翻到下方后再拖动，位移仍能生效（不因方向翻转而失效）', async () => {
+  setComposerTop(16)
+  mountCustom()
+  const base = styleOf(panelEl())
+  await drag(headEl(), 500, 500, 470, 500) // 向左 30
+  const geom = storedGeom()
+  assert.equal(geom.offsetX, -30, `左拖 30 → offsetX -30，实际 ${geom.offsetX}`)
+  assert.equal(styleOf(panelEl()).left, base.left - 30, '面板应随位移左移')
+  setComposerTop(500)
+})
+
+console.log(`\n${passed} 项全部通过`)

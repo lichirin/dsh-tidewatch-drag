@@ -1,0 +1,7 @@
+# dsh-tidewatch-drag bundle patch: one host row over the web profile.
+# 本地改造版（可拖拽）。行名从 profile 的 node_modules 解析——用
+# `dsh plugin --profile web add link:<插件目录>`
+# 安装时会以 link 方式挂载。
+- insert:
+    - id: tidewatch-drag
+      name: dsh-tidewatch-drag
